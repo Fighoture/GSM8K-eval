@@ -1,41 +1,21 @@
-import copy
-import os
-import ssl
-import urllib.request
-
-import os.path as osp
 import gzip
 import json
 
+from transformers import StoppingCriteria
 
-def download_url(url: str, folder="folder"):
-    """
-    Downloads the content of an url to a folder. Modified from \
-    https://github.com/pyg-team/pytorch_geometric/tree/master/torch_geometric
+class StopOnKeyword(StoppingCriteria):
+    def __init__(self, tokenizer, stop_string, existing_number=1):
+        self.tokenizer = tokenizer
+        self.stop_string = stop_string
+        self.existing_number = existing_number
 
-    Args:
-        url (string): The url of target file.
-        folder (string): The target folder.
-
-    Returns:
-        string: File path of downloaded files.
-    """
-
-    file = url.rpartition("/")[2]
-    file = file if file[0] == "?" else file.split("?")[0]
-    path = osp.join(folder, file)
-    if osp.exists(path):
-        print(f"File {file} exists, use existing file.")
-        return path
-
-    print(f"Downloading {url}")
-    os.makedirs(folder, exist_ok=True)
-    ctx = ssl._create_unverified_context()
-    data = urllib.request.urlopen(url, context=ctx)
-    with open(path, "wb") as f:
-        f.write(data.read())
-
-    return path
+    def __call__(self, input_ids, scores, **kwargs):
+        for i in range(input_ids.shape[0]):
+            text = self.tokenizer.decode(input_ids[i], skip_special_tokens=True)
+            stop_string_occurrences = len(text.split(self.stop_string)) - 1
+            if stop_string_occurrences <= self.existing_number:
+                return False
+        return True
 
 
 def load_jsonl(

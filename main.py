@@ -2,14 +2,13 @@ import torch
 import re
 import os
 import random
+import json
 import transformers
 from tqdm import tqdm
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, AutoConfig, StoppingCriteria
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 
-from utils import download_url, load_jsonl
+from utils import load_jsonl, StopOnKeyword
 import argparse
 
 transformers.logging.set_verbosity(40)
@@ -19,9 +18,9 @@ INVALID_ANS = "[invalid]"
 
 N_SHOT = 8
 COT_FLAG = True
-DEBUG = False
 ANSWER_TRIGGER = "The answer is"
-
+MAX_MODEL_LENGTH = 4096
+MAX_NEW_TOKEN = 256
 
 def extract_answer_from_output(completion):
     match = ANS_RE.search(completion)
@@ -161,7 +160,7 @@ def create_demo_text(n_shot=8, cot_flag=True):
 
 def build_prompt(input_text, n_shot, cot_flag):
     demo = create_demo_text(n_shot, cot_flag)
-    input_text_prompt = demo + "Q: " + input_text + "\n" + "A:"
+    input_text_prompt = demo + "Q: " + input_text + "\nA:"
     return input_text_prompt
 
 
@@ -211,83 +210,101 @@ def seed_everything(seed: int):
     torch.backends.cudnn.benchmark = True
 
 
-def load(model_name_or_path):
-    print(f"Loading model from {model_name_or_path} ...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name_or_path,
-        trust_remote_code=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is not None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+def load_peft_model(model, peft_model_path):
+    model = PeftModel.from_pretrained(model, peft_model_path)
+    model = model.merge_and_unload()
+    return model
+
+
+def load_model(model_path, prune_result, peft_model):
+    print("transformers model loading")
+    if prune_result != ".":
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config.pre_ffn_hidden = True
+
+        if prune_result.endswith(".json"):
+            pruning_file_path = prune_result
+        elif "c4_prune.json" in os.listdir(prune_result):
+            pruning_file_path = f"{prune_result}/c4_prune.json"
+        elif "MathInstruct_prune.json" in os.listdir(prune_result):
+            pruning_file_path = f"{prune_result}/MathInstruct_prune.json"
         else:
-            tokenizer.pad_token_id = 0
+            raise FileNotFoundError("Could not find pruning file.")
+        print(f"pruning_file_path: {pruning_file_path}")
+        with open(pruning_file_path, "r") as f:
+            pruned_mask = json.load(f)
+        config.pruned_mask = pruned_mask
+        config.max_position_embeddings = MAX_MODEL_LENGTH
 
-    model.eval()
+        llm = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    else:
+        llm = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="auto",
+            trust_remote_code=True,
+        )
 
-    return model, tokenizer
+    llm.generation_config = GenerationConfig.from_pretrained(model_path)
+    llm.generation_config.pad_token_id = llm.generation_config.eos_token_id
+    if peft_model != ".":
+        dir_list = os.listdir(peft_model)
+        if "adapter_model.safetensors" not in dir_list:
+            for dir_path in dir_list:
+                peft_model_path = os.path.join(peft_model, dir_path)
+                llm = load_peft_model(llm, peft_model_path)
+                print(f"model peft merge from {peft_model_path}")
+        else:
+            llm = load_peft_model(llm, peft_model)
+            print(f"model peft merge from {peft_model}")
+
+    print(f"transformers model loading finish.")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    print("tokenizer loaded.")
+    return llm, tokenizer
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_name_or_path",
+        "--model_path",
         type=str,
         default="/dataset/llama2/llama-2-7b-hf",
-        help="The model checkpoint for weights initialization.",
+        help="The model path.",
     )
     parser.add_argument(
-        "--data_root",
+        "--data_dir",
         type=str,
         default="./data",
-        help="The root folder of the data.",
+        help="The dir of the data.",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed.",
-    )
-    parser.add_argument(
-        "--output_dir",
+        "--save_dir",
         type=str,
-        default="./output",
-        help="The output directory where the model predictions and checkpoints will be written.",
+        default="./data",
+        help="The dir of saving.",
     )
-
-    parser.add_argument("--load", type=str, default=None, help="load quantized model")
+    parser.add_argument("--peft_model", "-pm", type=str, default=".")
+    parser.add_argument("--prune_result", "-pr", type=str, default=".")
+    parser.add_argument("--batch_size", "-bs", type=int, default=64)
+    parser.add_argument("--seed", "-s", type=int, default=1993)
 
     args = parser.parse_args()
     return args
 
 
-def generate(model, tokenizer, input_text, generate_kwargs):
-    input_text = tokenizer(
-        input_text,
-        padding=False,
-        add_special_tokens=True,
-        return_tensors="pt",
-    )
-    input_ids = input_text.input_ids.cuda()
-    attention_mask = input_text.attention_mask.cuda()
+def generate(model, tokenizer, batch_inputs, stop_criteria, generate_kwargs):
+    input_text = tokenizer(batch_inputs, padding=True, return_tensors="pt")
 
-    output_ids = model.generate(
-        input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs
-    )
+    output_ids = model.generate(**input_text, **generate_kwargs, stopping_criteria=[stop_criteria])
     response = []
     for i in range(output_ids.shape[0]):
         response.append(
-            tokenizer.decode(
-                output_ids[i][input_ids.shape[1] :],
-                skip_special_tokens=True,
-                ignore_tokenization_space=True,
-            )
+            tokenizer.decode(output_ids[i][len(input_text["input_ids"][i]):], skip_special_tokens=True, ignore_tokenization_space=True)
         )
 
     if len(response) > 1:
@@ -295,62 +312,95 @@ def generate(model, tokenizer, input_text, generate_kwargs):
     return response[0]
 
 
-def main():
-    args = parse_args()
+def args_generate_path(args):
+    model_name = args.model_path.split("/")[-1]
+    if "/result/" in args.peft_model:
+        save_pre_list = args.peft_model.split("/result/")[-1].split("/")
+    elif "/pruned_result/" in args.prune_result:
+        save_pre_str = args.prune_result.split("/pruned_result/")[-1]
+        if save_pre_str.endswith(".json"):
+            flag = save_pre_str.split("/")[-1].split(".json")[0]
+            save_pre_list = save_pre_str.split("/")[:-1]
+            save_pre_list = ["pruned"] + save_pre_list + [flag]
+        else:
+            save_pre_list = save_pre_str.split("/")
+            save_pre_list = ["pruned"] + save_pre_list
+    else:
+        save_pre_list = []
+    return [model_name] + save_pre_list
 
+
+def check_exist(exists_result, sample):
+    for each in exists_result:
+        if sample["instruction"] == each["instruction"]:
+            if "generation" in each:
+                return True
+            else:
+                return False
+        else:
+            continue
+    return False
+
+
+def main():
     seed_everything(args.seed)
 
-    test_filepath = os.path.join(args.data_root, "gsm8k_test.jsonl")
-    if not os.path.exists(test_filepath):
-        download_url(
-            "https://raw.githubusercontent.com/openai/"
-            "grade-school-math/2909d34ef28520753df82a2234c357259d254aa8/"
-            "grade_school_math/data/test.jsonl",
-            args.data_root,
-        )
-        os.rename(os.path.join(args.data_root, "test.jsonl"), test_filepath)
-
+    test_filepath = os.path.join(args.data_dir, "test.jsonl")
     list_data_dict = load_jsonl(test_filepath, instruction="question", output="answer")
 
-    model, tokenizer = load(args.model_name_or_path)
+    output_dir = os.path.join(args.save_dir, "/".join(args_generate_path(args)))
+    print("output_dir: ", output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    if args.load:
-        print("loading...", args.load)
-        model_state = torch.load(args.load, map_location="cpu")
-        model.load_state_dict(model_state, strict=False)
-        model.half().cuda()
+    output_path = os.path.join(output_dir, "results.txt")
+    if os.path.exists(output_path):
+        with open(output_path, "r") as fi:
+            exists_result = json.load(fi)
+    else:
+        exists_result = []
 
-    answers = []
+    prompt_inputs = []
+    outputs = []
     for sample in tqdm(list_data_dict):
-        input_text = build_prompt(sample["instruction"], N_SHOT, COT_FLAG)
-        generate_kwargs = dict(max_new_tokens=256, top_p=0.95, temperature=0.8)
-        model_completion = generate(model, tokenizer, input_text, generate_kwargs)
-        model_answer = clean_answer(model_completion)
-        is_cor = is_correct(model_answer, sample["output"])
-        answers.append(is_cor)
-        if DEBUG:
-            print(f"Full input_text:\n{input_text}\n\n")
-        print(
-            f'Question: {sample["instruction"]}\n\n'
-            f'Answers: {extract_answer_from_output(sample["output"])}\n\n'
-            f"Model Answers: {model_answer}\n\n"
-            f"Model Completion: {model_completion}\n\n"
-            f"Is correct: {is_cor}\n\n"
-        )
+        if check_exist(exists_result, sample):
+            continue
 
+        input_text = build_prompt(sample["instruction"], N_SHOT, COT_FLAG)
+        prompt_inputs.append(input_text)
+        outputs.append(sample["output"])
+
+    model, tokenizer = load_model(args.model_path, args.prune_result, args.peft_model)
+
+    print("processing sample number: ", len(prompt_inputs))
+    stop_criteria = StopOnKeyword(tokenizer=tokenizer, stop_string="Q:", existing_number=1 + N_SHOT)
+    answers = []
+    for batch_idx in tqdm(range(len(prompt_inputs) // args.batch_size)):
+        start_idx = batch_idx * args.batch_size
+        end_idx = min((batch_idx + 1) * args.batch_size, len(prompt_inputs))
+        batch_inputs = prompt_inputs[start_idx:end_idx]
+        batch_outputs = outputs[start_idx:end_idx]
+        generate_kwargs = dict(max_new_tokens=MAX_NEW_TOKEN, top_p=0.95, temperature=0.8)
+
+        model_completion = generate(model, tokenizer, batch_inputs, stop_criteria, generate_kwargs)
+        model_answer = [clean_answer(completion) for completion in model_completion]
+
+        for i in range(args.batch_size):
+            original_input = batch_inputs[i].split("Q: ")[-1].split("\nA:")[0]
+            element = {"instruction": original_input, "output": batch_outputs[i], "generation": model_completion[i]}
+            exists_result.append(element)
+        with open(output_path, "w") as f:
+            f.write(json.dumps(exists_result))
+
+        is_cor = [is_correct(model_answer[i], batch_outputs[i]) for i in range(len(model_answer))]
+        answers.extend(is_cor)
         print(
             f"Num of total question: {len(answers)}, "
             f"Correct num: {sum(answers)}, "
-            f"Accuracy: {float(sum(answers))/len(answers)}."
+            f"Accuracy: {float(sum(answers)) / len(answers)}."
         )
 
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    with open(os.path.join(args.output_dir, "results.txt"), "w") as f:
-        for answer in answers:
-            print(answer, file=f)
-
-    with open(os.path.join(args.output_dir, "scores.txt"), "w") as f:
+    with open(os.path.join(output_dir, "scores.txt"), "w") as f:
         print(
             f"Num of total question: {len(answers)}, "
             f"Correct num: {sum(answers)}, "
@@ -360,4 +410,5 @@ def main():
 
 
 if __name__ == "__main__":
+    args = parse_args()
     main()
