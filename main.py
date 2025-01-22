@@ -323,10 +323,10 @@ def args_generate_path(args):
         save_pre_str = args.prune_result.split("/pruned_result/")[-1]
         if save_pre_str.endswith(".json"):
             flag = save_pre_str.split("/")[-1].split(".json")[0]
-            save_pre_list = save_pre_str.split("/")[:-1]
+            save_pre_list = save_pre_str.split("/")[1:-1]
             save_pre_list = ["pruned"] + save_pre_list + [flag]
         else:
-            save_pre_list = save_pre_str.split("/")
+            save_pre_list = save_pre_str.split("/")[1:]
             save_pre_list = ["pruned"] + save_pre_list
     else:
         save_pre_list = []
